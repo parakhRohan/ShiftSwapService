@@ -1,0 +1,252 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  JAVA_VERSION: "17"
+  IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+  REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+
+# ──────────────────────────────────────────────────────────────
+# JOB 1 — Build & Test
+# ──────────────────────────────────────────────────────────────
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run tests
+        run: ./mvnw -B verify
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+      - name: Upload JAR
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 2 — Build & Push Docker image  (main branch only)
+  # ──────────────────────────────────────────────────────────────
+  docker-publish:
+    name: Docker Build & Push
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable=true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 3 — Deploy to staging via Helm  (main branch only)
+  # ──────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: docker-publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+
+    env:
+      IMAGE_TAG: ${{ needs.docker-publish.outputs.image-tag }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      # Determine the currently inactive color so we deploy to it first.
+      - name: Resolve target color (blue/green)
+        id: color
+        run: |
+          ACTIVE=$(helm get values shift-swap-service -n staging \
+            --output json 2>/dev/null \
+            | jq -r '.blueGreen.activeColor // "blue"')
+          TARGET=$([ "$ACTIVE" = "blue" ] && echo "green" || echo "blue")
+          echo "active=$ACTIVE"   >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET"   >> "$GITHUB_OUTPUT"
+
+      - name: Deploy inactive color (${{ steps.color.outputs.target }})
+        run: |
+          helm upgrade --install shift-swap-service ./helm/shift-swap-service \
+            --namespace staging \
+            --create-namespace \
+            --set image.repository=${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }} \
+            --set blueGreen.${{ steps.color.outputs.target }}.imageTag=${{ env.IMAGE_TAG }} \
+            --set blueGreen.activeColor=${{ steps.color.outputs.active }} \
+            --set env.springProfilesActive=staging \
+            --set env.appSeedDataEnabled=false \
+            --wait \
+            --timeout 5m
+
+      - name: Smoke test inactive color
+        run: |
+          # Basic liveness check; extend with real smoke tests as needed.
+          kubectl rollout status deployment/shift-swap-service-${{ steps.color.outputs.target }} \
+            -n staging --timeout=120s
+
+      - name: Switch traffic to ${{ steps.color.outputs.target }}
+        run: |
+          helm upgrade shift-swap-service ./helm/shift-swap-service \
+            --namespace staging \
+            --reuse-values \
+            --set blueGreen.activeColor=${{ steps.color.outputs.target }} \
+            --wait \
+            --timeout 2m
+
+      - name: Verify active deployment is healthy
+        run: |
+          kubectl rollout status deployment/shift-swap-service-${{ steps.color.outputs.target }} \
+            -n staging --timeout=60s
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 4 — Deploy to production  (manual approval gate)
+  # ──────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    needs: [ docker-publish, deploy-staging ]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production   # requires a reviewer approval in GitHub
+
+    env:
+      IMAGE_TAG: ${{ needs.docker-publish.outputs.image-tag }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Resolve target color (blue/green)
+        id: color
+        run: |
+          ACTIVE=$(helm get values shift-swap-service -n production \
+            --output json 2>/dev/null \
+            | jq -r '.blueGreen.activeColor // "blue"')
+          TARGET=$([ "$ACTIVE" = "blue" ] && echo "green" || echo "blue")
+          echo "active=$ACTIVE"   >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET"   >> "$GITHUB_OUTPUT"
+
+      - name: Deploy inactive color (${{ steps.color.outputs.target }})
+        run: |
+          helm upgrade --install shift-swap-service ./helm/shift-swap-service \
+            --namespace production \
+            --create-namespace \
+            --set image.repository=${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }} \
+            --set blueGreen.${{ steps.color.outputs.target }}.imageTag=${{ env.IMAGE_TAG }} \
+            --set blueGreen.activeColor=${{ steps.color.outputs.active }} \
+            --set env.springProfilesActive=prod \
+            --set env.appSeedDataEnabled=false \
+            --wait \
+            --timeout 5m
+
+      - name: Smoke test inactive color
+        run: |
+          kubectl rollout status deployment/shift-swap-service-${{ steps.color.outputs.target }} \
+            -n production --timeout=120s
+
+      - name: Switch traffic to ${{ steps.color.outputs.target }}
+        run: |
+          helm upgrade shift-swap-service ./helm/shift-swap-service \
+            --namespace production \
+            --reuse-values \
+            --set blueGreen.activeColor=${{ steps.color.outputs.target }} \
+            --wait \
+            --timeout 2m
+
+      - name: Verify active deployment is healthy
+        run: |
+          kubectl rollout status deployment/shift-swap-service-${{ steps.color.outputs.target }} \
+            -n production --timeout=60s
+
+      - name: Tag release in Git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "release/${{ env.IMAGE_TAG }}"
+          git push origin "release/${{ env.IMAGE_TAG }}"
