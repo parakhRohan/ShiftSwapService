@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "shift-swap-service.fullname" . }}-blue
+  labels:
+    {{- include "shift-swap-service.labels" . | nindent 4 }}
+    color: blue
+spec:
+  replicas: {{ .Values.blueGreen.blue.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "shift-swap-service.selectorLabels" . | nindent 6 }}
+      color: blue
+  template:
+    metadata:
+      labels:
+        {{- include "shift-swap-service.selectorLabels" . | nindent 8 }}
+        color: blue
+    spec:
+      containers:
+        - name: shift-swap-service
+          image: "{{ .Values.image.repository }}:{{ .Values.blueGreen.blue.imageTag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.containerPort }}
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: {{ .Values.env.springProfilesActive | quote }}
+            - name: APP_SEED_DATA_ENABLED
+              value: {{ .Values.env.appSeedDataEnabled | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "shift-swap-service.fullname" . }}-green
+  labels:
+    {{- include "shift-swap-service.labels" . | nindent 4 }}
+    color: green
+spec:
+  replicas: {{ .Values.blueGreen.green.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "shift-swap-service.selectorLabels" . | nindent 6 }}
+      color: green
+  template:
+    metadata:
+      labels:
+        {{- include "shift-swap-service.selectorLabels" . | nindent 8 }}
+        color: green
+    spec:
+      containers:
+        - name: shift-swap-service
+          image: "{{ .Values.image.repository }}:{{ .Values.blueGreen.green.imageTag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.containerPort }}
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: {{ .Values.env.springProfilesActive | quote }}
+            - name: APP_SEED_DATA_ENABLED
+              value: {{ .Values.env.appSeedDataEnabled | quote }}

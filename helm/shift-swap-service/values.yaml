@@ -1,0 +1,38 @@
+replicaCount: 1
+
+image:
+  repository: registry.example.com/shift-swap-service
+  tag: latest
+  pullPolicy: IfNotPresent
+
+blueGreen:
+  activeColor: blue
+  blue:
+    imageTag: latest
+    replicaCount: 1
+  green:
+    imageTag: latest
+    replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+containerPort: 8080
+
+resources: {}
+
+env:
+  springProfilesActive: prod
+  appSeedDataEnabled: "false"
+
+serviceAccount:
+  create: false
+  name: ""
+
+ingress:
+  enabled: false
+  className: ""
+  hosts: []
+  tls: []
